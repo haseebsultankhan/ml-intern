@@ -16,6 +16,7 @@ glues it to CLI output + session state.
 from __future__ import annotations
 
 import asyncio
+import os
 
 from litellm import acompletion
 
@@ -42,16 +43,70 @@ SUGGESTED_MODELS = [
         "id": "bedrock/us.anthropic.claude-opus-4-6-v1",
         "label": "Claude Opus 4.6 via Bedrock",
     },
+    {"id": "gemini/gemini-2.5-pro", "label": "Gemini 2.5 Pro"},
+    {"id": "gemini/gemini-2.5-flash", "label": "Gemini 2.5 Flash"},
+    {"id": "ollama_cloud/gpt-oss:120b-cloud", "label": "GPT-OSS 120B (Ollama Cloud)"},
+    {"id": "ollama", "label": "Local Ollama — opens picker"},
     {"id": "MiniMaxAI/MiniMax-M2.7", "label": "MiniMax M2.7"},
     {"id": "moonshotai/Kimi-K2.6", "label": "Kimi K2.6"},
     {"id": "zai-org/GLM-5.1", "label": "GLM 5.1"},
     {"id": "deepseek-ai/DeepSeek-V4-Pro:deepinfra", "label": "DeepSeek V4 Pro"},
 ]
 
+# Providers that silently ignore reasoning_effort on the wire. We skip
+# the effort probe entirely for these so we don't cache a bogus
+# "effective" level against an endpoint that would have accepted any
+# value without enforcing it.
+_NO_EFFORT_PROVIDERS = ("ollama_chat/", "ollama_cloud/")
 
+# Providers that should bypass the HF router catalog lookup in
+# ``_print_hf_routing_info``. The probe + LiteLLM adapter still cover
+# "does this model exist" on the first real call.
 _ROUTING_POLICIES = {"fastest", "cheapest", "preferred"}
-_DIRECT_PREFIXES = ("anthropic/", "openai/", *LOCAL_MODEL_PREFIXES)
+_DIRECT_PREFIXES = (
+    "anthropic/",
+    "openai/",
+    "bedrock/",
+    "gemini/",
+    "ollama_chat/",
+    "ollama_cloud/",
+    *LOCAL_MODEL_PREFIXES,
+)
 _LOCAL_PROBE_TIMEOUT = 15.0
+
+
+def _has_gemini_key() -> bool:
+    return bool(
+        os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    )
+
+
+def _has_ollama_cloud_key() -> bool:
+    return bool(os.environ.get("OLLAMA_API_KEY"))
+
+
+def _warn_if_ollama_down(model_id: str, console) -> None:
+    """If the user picked an ``ollama_chat/<tag>`` but the daemon isn't
+    reachable, warn now — cheaper than a late connection error.
+
+    Also warns if the specific tag isn't currently installed. These are
+    warnings only; we still let the switch proceed because the user may
+    be about to start the daemon or pull the model.
+    """
+    from agent.core import ollama_discovery as disco
+
+    tag = model_id.split("/", 1)[1]
+    try:
+        installed = {m.name for m in disco.list_local_models()}
+    except disco.OllamaUnavailable as e:
+        console.print(f"[bold red]Warning:[/bold red] {e}")
+        return
+    if tag not in installed:
+        suggestions = ", ".join(sorted(installed)[:4]) or "(none installed)"
+        console.print(
+            f"[bold red]Warning:[/bold red] '{tag}' isn't installed locally. "
+            f"Available: {suggestions}. Pull it with `ollama pull {tag}`."
+        )
 
 
 def is_valid_model_id(model_id: str) -> bool:
@@ -61,14 +116,25 @@ def is_valid_model_id(model_id: str) -> bool:
       • anthropic/<model>
       • openai/<model>
       • ollama/<model>, vllm/<model>, lm_studio/<model>, llamacpp/<model>
+      • bedrock/<model>
+      • gemini/<model>
+      • ollama_chat/<tag>
+      • ollama_cloud/<tag>
       • <org>/<model>[:<tag>]            (HF router; tag = provider or policy)
       • huggingface/<org>/<model>[:<tag>] (same, accepts legacy prefix)
+
+    Also accepts the bare sentinels ``ollama`` and ``ollama_cloud`` — the
+    REPL uses those to open the interactive picker. The picker is
+    triggered in ``agent.main``, not here, but we must not reject these
+    as malformed.
 
     Actual availability is verified against the HF router catalog on
     switch, and by the provider on the probe's ping call.
     """
     if not model_id:
         return False
+    if model_id in ("ollama", "ollama_cloud"):
+        return True
     if is_local_model_id(model_id):
         return True
     if is_reserved_local_model_id(model_id):
@@ -88,10 +154,26 @@ def _print_hf_routing_info(model_id: str, console) -> bool:
     proceed with the switch, ``False`` to indicate a hard problem the user
     should notice before we fire the effort probe.
 
-    Anthropic / OpenAI ids return ``True`` without printing anything —
-    the probe below covers "does this model exist".
+    Anthropic / OpenAI / Bedrock / Gemini / Ollama ids return ``True``
+    without printing anything — the probe (or first real call) covers
+    "does this model exist".
     """
     if model_id.startswith(_DIRECT_PREFIXES):
+        # Native-Ollama health check: if the user picked an ``ollama_chat/``
+        # model but the daemon isn't up, surface that now instead of
+        # letting the first real request blow up with a connection error.
+        if model_id.startswith("ollama_chat/"):
+            _warn_if_ollama_down(model_id, console)
+        if model_id.startswith("ollama_cloud/") and not _has_ollama_cloud_key():
+            console.print(
+                "[bold red]Warning:[/bold red] OLLAMA_API_KEY is not set. "
+                "Ollama Cloud requests will fail with 401 until you export it."
+            )
+        if model_id.startswith("gemini/") and not _has_gemini_key():
+            console.print(
+                "[bold red]Warning:[/bold red] GEMINI_API_KEY (or GOOGLE_API_KEY) "
+                "is not set. Gemini requests will fail until you export it."
+            )
         return True
 
     from agent.core import hf_router_catalog as cat
@@ -162,9 +244,14 @@ def print_model_listing(config, console) -> None:
     console.print(
         "\n[dim]Paste any HF model id (e.g. 'MiniMaxAI/MiniMax-M2.7').\n"
         "Add ':fastest', ':cheapest', ':preferred', or ':<provider>' to override routing.\n"
-        "Use 'anthropic/<model>' or 'openai/<model>' for direct API access.\n"
+        "Direct APIs: 'anthropic/<model>', 'openai/<model>', 'gemini/<model>'.\n"
         "Use 'ollama/<model>', 'vllm/<model>', 'lm_studio/<model>', or "
-        "'llamacpp/<model>' for local OpenAI-compatible endpoints.[/dim]"
+        "'llamacpp/<model>' for local OpenAI-compatible endpoints.\n"
+        "Ollama:\n"
+        "  • '/model ollama'         — arrow-key picker of locally installed models\n"
+        "  • '/model ollama_chat/qwen2.5:14b'  — pick a specific local tag\n"
+        "  • '/model ollama_cloud'   — arrow-key picker for Ollama Cloud (needs OLLAMA_API_KEY)\n"
+        "  • '/model ollama_cloud/gpt-oss:120b-cloud' — pick a specific cloud tag[/dim]"
     )
 
 
@@ -175,6 +262,8 @@ def print_invalid_id(arg: str, console) -> None:
         "  • <org>/<model>[:tag]    (HF router — paste from huggingface.co)\n"
         "  • anthropic/<model>\n"
         "  • openai/<model>\n"
+        "  • gemini/<model>\n"
+        "  • ollama_chat/<tag> | ollama_cloud/<tag>\n"
         "  • ollama/<model> | vllm/<model> | lm_studio/<model> | llamacpp/<model>[/dim]"
     )
 
@@ -234,6 +323,19 @@ async def probe_and_switch_model(
     if not _print_hf_routing_info(model_id, console):
         return
 
+    # Ollama (native + cloud) endpoints silently accept unknown params,
+    # which would cause the probe to cache a wrong "effective" level.
+    # Commit with effort=None and skip the probe. ``cache=False`` so a
+    # future /effort change can still try to re-send something (it won't
+    # land either, but the control flow stays consistent).
+    if model_id.startswith(_NO_EFFORT_PROVIDERS):
+        _commit_switch(model_id, config, session, effective=None, cache=False)
+        console.print(
+            f"[green]Model switched to {model_id}[/green] "
+            "[dim](effort: off — Ollama ignores effort params)[/dim]"
+        )
+        return
+
     if not preference:
         # Nothing to validate with a ping that we couldn't validate on the
         # first real call just as cheaply. Skip the probe entirely.
@@ -272,6 +374,36 @@ async def probe_and_switch_model(
         f"[green]Model switched to {model_id}[/green] "
         f"[dim](effort: {effort_label}{suffix}, {outcome.elapsed_ms}ms)[/dim]"
     )
+
+
+async def handle_ollama_picker(
+    kind: str,
+    config,
+    session,
+    console,
+    hf_token: str | None,
+) -> None:
+    """Open the interactive picker and, if a model is chosen, switch to it.
+
+    ``kind`` is ``"local"`` (native daemon via /api/tags) or ``"cloud"``
+    (curated Ollama Cloud list). Cancel / unavailable daemon prints a
+    message and returns — current model is untouched.
+    """
+    from agent.core import ollama_picker
+
+    if kind == "local":
+        chosen = await ollama_picker.pick_local_model(console)
+    elif kind == "cloud":
+        chosen = await ollama_picker.pick_cloud_model(console)
+    else:
+        console.print(f"[red]Unknown Ollama picker kind: {kind}[/red]")
+        return
+
+    if not chosen:
+        console.print("[dim]No model selected. Current model unchanged.[/dim]")
+        return
+
+    await probe_and_switch_model(chosen, config, session, console, hf_token)
 
 
 def _commit_switch(model_id, config, session, effective, cache: bool) -> None:

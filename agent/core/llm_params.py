@@ -90,12 +90,38 @@ _patch_litellm_effort_validation()
 #   Anthropic (4.6+):  low | medium | high | xhigh | max   (output_config.effort)
 #   OpenAI direct:     minimal | low | medium | high | xhigh (reasoning_effort top-level)
 #   HF router:         low | medium | high                 (extra_body.reasoning_effort)
+#   Gemini (2.5+):     low | medium | high                 (reasoning_effort top-level;
+#                                                           LiteLLM maps to thinkingBudget)
+#   Ollama (native):   (none)                              silently ignored by the OpenAI-
+#                                                           compat endpoint, so we never send.
+#   Ollama Cloud:      (none)                              same as native.
 #
 # We validate *shape* here and let the probe cascade walk down on rejection;
 # we deliberately do NOT maintain a per-model capability table.
 _ANTHROPIC_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
 _OPENAI_EFFORTS = {"minimal", "low", "medium", "high", "xhigh"}
 _HF_EFFORTS = {"low", "medium", "high"}
+_GEMINI_EFFORTS = {"low", "medium", "high"}
+
+# Default endpoints for Ollama. Native respects OLLAMA_HOST (the standard env
+# var that the Ollama client itself uses). Cloud is OpenAI-compatible and
+# requires OLLAMA_API_KEY.
+_OLLAMA_NATIVE_DEFAULT = "http://localhost:11434"
+_OLLAMA_CLOUD_BASE = "https://ollama.com/v1"
+
+
+def _ollama_native_base() -> str:
+    """Return the base URL for a native Ollama daemon.
+
+    Respects ``OLLAMA_HOST`` (the standard Ollama env var — e.g.
+    ``http://192.168.1.10:11434`` or bare ``192.168.1.10:11434``).
+    """
+    host = os.environ.get("OLLAMA_HOST", "").strip()
+    if not host:
+        return _OLLAMA_NATIVE_DEFAULT
+    if host.startswith("http://") or host.startswith("https://"):
+        return host.rstrip("/")
+    return f"http://{host.rstrip('/')}"
 
 
 class UnsupportedEffortError(ValueError):
@@ -241,6 +267,88 @@ def _resolve_llm_params(
                     )
             else:
                 params["reasoning_effort"] = reasoning_effort
+        return params
+
+    if model_name.startswith("gemini/"):
+        # Gemini via LiteLLM's ``gemini/`` adapter. Auth via GEMINI_API_KEY
+        # (or GOOGLE_API_KEY as a fallback — LiteLLM accepts either, but
+        # we pass explicitly so the error message is actionable when it's
+        # missing).
+        #
+        # Thinking: Gemini 2.5 Pro/Flash expose a ``thinkingBudget`` via
+        # generation_config. LiteLLM maps ``reasoning_effort`` to budget
+        # tokens for us (low→1k, medium→8k, high→24k as of 1.83). Older
+        # 1.5/2.0 models ignore it; if you hit a model that rejects it,
+        # the probe cascade strips it.
+        api_key = (
+            os.environ.get("GEMINI_API_KEY")
+            or os.environ.get("GOOGLE_API_KEY")
+        )
+        params = {"model": model_name, "api_key": api_key}
+        if reasoning_effort:
+            level = "low" if reasoning_effort == "minimal" else reasoning_effort
+            if level not in _GEMINI_EFFORTS:
+                if strict:
+                    raise UnsupportedEffortError(
+                        f"Gemini doesn't accept effort={level!r}"
+                    )
+            else:
+                params["reasoning_effort"] = level
+        return params
+
+    if model_name.startswith("ollama_cloud/"):
+        # Ollama Cloud speaks OpenAI-compatible at https://ollama.com/v1.
+        # Auth: Bearer <OLLAMA_API_KEY>. We route through LiteLLM's generic
+        # OpenAI adapter (as ``openai/<model>``) pointed at that base_url —
+        # this is the supported pattern for OAI-compat endpoints and gives
+        # us reliable function-calling support.
+        cloud_model = model_name.removeprefix("ollama_cloud/")
+        params = {
+            "model": f"openai/{cloud_model}",
+            "api_base": _OLLAMA_CLOUD_BASE,
+            "api_key": os.environ.get("OLLAMA_API_KEY"),
+        }
+        # No effort support on Ollama Cloud — the endpoint silently drops
+        # unknown params, which would cause the probe cascade to cache a
+        # wrong "effective" level. If strict, raise so the probe walks
+        # down; otherwise just don't send anything.
+        if reasoning_effort and strict:
+            raise UnsupportedEffortError(
+                "Ollama Cloud doesn't accept reasoning_effort"
+            )
+        return params
+
+    if model_name.startswith("ollama_chat/"):
+        # Native Ollama via LiteLLM's /api/chat adapter. This path properly
+        # supports tool calling; the model picker emits ``ollama_chat/<tag>``
+        # because this agent is tool-call heavy.
+        #
+        # No API key. ``api_base`` respects OLLAMA_HOST. LiteLLM reads
+        # OLLAMA_API_BASE too; setting it explicitly here keeps the
+        # behavior deterministic regardless of which env var is set.
+        #
+        # ``num_ctx`` is the big one: Ollama's default context window is
+        # 2048 tokens, which this agent blows past with the system prompt
+        # + tool schemas alone (~10k+ tokens before the user types
+        # anything). Without this override the model is silently
+        # truncated and hangs "thinking" about a conversation it can't
+        # see. Default to 32k — covers most installed quants on a
+        # laptop — overridable with OLLAMA_NUM_CTX. LiteLLM's
+        # ``ollama_chat`` adapter forwards this as the ``options.num_ctx``
+        # field in the /api/chat payload.
+        try:
+            num_ctx = int(os.environ.get("OLLAMA_NUM_CTX", "32768"))
+        except ValueError:
+            num_ctx = 32768
+        params = {
+            "model": model_name,
+            "api_base": _ollama_native_base(),
+            "num_ctx": num_ctx,
+        }
+        if reasoning_effort and strict:
+            raise UnsupportedEffortError(
+                "Native Ollama doesn't accept reasoning_effort"
+            )
         return params
 
     if is_reserved_local_model_id(model_name):

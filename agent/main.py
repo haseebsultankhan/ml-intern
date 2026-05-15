@@ -960,11 +960,24 @@ async def _handle_slash_command(
         if not arg:
             model_switcher.print_model_listing(config, console)
             return None
+        session = session_holder[0] if session_holder else None
+        # Bare "/model ollama" and "/model ollama_cloud" open the
+        # interactive arrow-key picker. These are sentinels, not real
+        # litellm ids — handle them before is_valid_model_id / the probe.
+        if arg == "ollama":
+            await model_switcher.handle_ollama_picker(
+                "local", config, session, console, _get_hf_token(),
+            )
+            return None
+        if arg == "ollama_cloud":
+            await model_switcher.handle_ollama_picker(
+                "cloud", config, session, console, _get_hf_token(),
+            )
+            return None
         if not model_switcher.is_valid_model_id(arg):
             model_switcher.print_invalid_id(arg, console)
             return None
         normalized = arg.removeprefix("huggingface/")
-        session = session_holder[0] if session_holder else None
         await model_switcher.probe_and_switch_model(
             normalized,
             config,

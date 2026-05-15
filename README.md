@@ -31,16 +31,47 @@ ml-intern
 Create a `.env` file in the project root (or export these in your shell):
 
 ```bash
-ANTHROPIC_API_KEY=<your-anthropic-api-key> # if using anthropic models
-OPENAI_API_KEY=<your-openai-api-key> # if using openai models
-LOCAL_LLM_BASE_URL=http://localhost:8000 # shared fallback for local model prefixes
-LOCAL_LLM_API_KEY=<optional-local-api-key> # optional shared local API key
+# Required for HF-based tools (docs, papers, datasets, jobs)
 HF_TOKEN=<your-hugging-face-token>
-GITHUB_TOKEN=<github-personal-access-token> 
+GITHUB_TOKEN=<github-personal-access-token>
+
+# Set only the ones you'll use:
+ANTHROPIC_API_KEY=<your-anthropic-api-key>   # anthropic/<model>
+OPENAI_API_KEY=<your-openai-api-key>         # openai/<model>
+GEMINI_API_KEY=<your-gemini-api-key>         # gemini/<model>  (GOOGLE_API_KEY also works)
+OLLAMA_API_KEY=<your-ollama-cloud-api-key>   # ollama_cloud/<model>
+OLLAMA_HOST=http://localhost:11434           # native ollama; only set if non-default
+LOCAL_LLM_BASE_URL=http://localhost:8000     # shared fallback for local model prefixes
+LOCAL_LLM_API_KEY=<optional-local-api-key>   # optional shared local API key
 ```
 If no `HF_TOKEN` is set, the CLI will prompt you to paste one on first launch
 unless you start on a local model. To get a GITHUB_TOKEN follow the tutorial
 [here](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens#creating-a-fine-grained-personal-access-token).
+
+### Model providers
+
+In the REPL, use `/model <id>` to switch. Supported ids:
+
+```
+anthropic/claude-opus-4-7
+openai/gpt-5
+gemini/gemini-2.5-pro
+ollama_chat/qwen2.5:14b            # native Ollama (requires ollama serve)
+ollama_cloud/gpt-oss:120b-cloud    # Ollama Cloud (requires OLLAMA_API_KEY)
+<org>/<model>[:<provider>]         # any HF router model
+```
+
+For native Ollama, **`/model ollama`** opens an arrow-key picker of models
+installed on the local daemon (hit via `/api/tags`). **`/model ollama_cloud`**
+opens a picker for curated cloud-hosted models.
+
+**Local Ollama caveats.** This agent is tool-call heavy (dozens of structured
+tool schemas for HF docs, sandbox, GitHub, datasets, etc.). Expect unreliable
+behavior from anything below ~7B parameters or from model families that aren't
+specifically tool-tuned. The picker tags risky entries with `small model` /
+`unknown tool-call`; you can still pick them. Context-window limits on local
+models are typically far below the 170k compactor threshold — expect frequent
+compaction or errors on long sessions.
 
 ### Usage
 

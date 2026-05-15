@@ -556,9 +556,12 @@ def _friendly_error_message(error: Exception) -> str | None:
         return (
             "Authentication failed — your API key is missing or invalid.\n\n"
             "To fix this, set the API key for your model provider:\n"
-            "  • Anthropic:   export ANTHROPIC_API_KEY=sk-...\n"
-            "  • OpenAI:      export OPENAI_API_KEY=sk-...\n"
-            "  • HF Router:   export HF_TOKEN=hf_...\n\n"
+            "  • Anthropic:     export ANTHROPIC_API_KEY=sk-...\n"
+            "  • OpenAI:        export OPENAI_API_KEY=sk-...\n"
+            "  • Gemini:        export GEMINI_API_KEY=...\n"
+            "  • Ollama Cloud:  export OLLAMA_API_KEY=...\n"
+            "  • Native Ollama: no key — set OLLAMA_HOST if not on localhost\n"
+            "  • HF Router:     export HF_TOKEN=hf_...\n\n"
             "You can also add it to a .env file in the project root.\n"
             "To switch models, use the /model command."
         )
